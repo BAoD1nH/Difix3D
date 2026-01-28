@@ -2,12 +2,12 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass, field
 from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import imageio
-import nerfview
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -15,44 +15,36 @@ import tqdm
 import tyro
 import viser
 import yaml
-import random
-from PIL import Image
-from copy import deepcopy
+from gsplat.color_correct import color_correct_affine, color_correct_quadratic
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
-    generate_interpolated_path,
     generate_ellipse_path_z,
+    generate_interpolated_path,
     generate_spiral_path,
 )
+from fused_ssim import fused_ssim
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
-from lib_bilagrid import (
-    BilateralGrid,
-    slice,
-    color_correct,
-    total_variation_loss,
-)
 
+from gsplat import export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
+from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat.optimizers import SelectiveAdam
-
-from examples.utils import CameraPoseInterpolator
-from src.pipeline_difix import DifixPipeline
+from gsplat_viewer import GsplatViewer, GsplatRenderTabState
+from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = True # ! turn off viser
+    disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
@@ -76,6 +68,8 @@ class Config:
     normalize_world_space: bool = True
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
+    # Load EXIF exposure metadata from images (if available)
+    load_exposure: bool = True
 
     # Port for the viewer server
     port: int = 8080
@@ -86,13 +80,17 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 60_000
+    max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [1_0000, 2_0000, 3_0000, 3_5000, 4_0000, 4_5000, 5_0000, 5_5000, 6_0000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [1_0000, 2_0000, 3_0000, 4_0000, 4_5000, 5_0000, 5_5000, 6_0000])
-    # Steps to fix the artifacts
-    fix_steps: List[int] = field(default_factory=lambda: [3_000, 6_000, 8_000, 10_000, 12_000, 14_000, 16_000, 18_000, 20_000, 22_000, 24_000, 26_000, 28_000, 30_000, 32_000, 34_000, 36_000, 38_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 52_000, 54_000, 56_000, 58_000, 60_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # Whether to save ply file (storage size can be large)
+    save_ply: bool = False
+    # Steps to save the model as ply
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # Whether to disable video generation during training and evaluation
+    disable_video: bool = False
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -110,8 +108,6 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
-    # Weight for iterative 3d update
-    novel_data_lambda: float = 0.3
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -133,6 +129,19 @@ class Config:
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
+
+    # LR for 3D point positions
+    means_lr: float = 1.6e-4
+    # LR for Gaussian scale factors
+    scales_lr: float = 5e-3
+    # LR for alpha blending weights
+    opacities_lr: float = 5e-2
+    # LR for orientation (quaternions)
+    quats_lr: float = 1e-3
+    # LR for SH band 0 (brightness)
+    sh0_lr: float = 2.5e-3
+    # LR for higher-order SH (detail)
+    shN_lr: float = 2.5e-3 / 20
 
     # Opacity regularization
     opacity_reg: float = 0.0
@@ -157,10 +166,22 @@ class Config:
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
-    # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
+    # Post-processing method for appearance correction (experimental)
+    post_processing: Optional[Literal["bilateral_grid", "ppisp"]] = None
+    # Use fused implementation for bilateral grid (only applies when post_processing="bilateral_grid")
+    bilateral_grid_fused: bool = False
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
+    # Enable PPISP controller
+    ppisp_use_controller: bool = True
+    # Use controller distillation in PPISP (only applies when post_processing="ppisp" and ppisp_use_controller=True)
+    ppisp_controller_distillation: bool = True
+    # Controller activation ratio for PPISP (only applies when post_processing="ppisp" and ppisp_use_controller=True)
+    ppisp_controller_activation_num_steps: int = 25_000
+    # Color correction method for cc_* metrics (only applies when post_processing is set)
+    color_correct_method: Literal["affine", "quadratic"] = "affine"
+    # Compute color-corrected metrics (cc_psnr, cc_ssim, cc_lpips) during evaluation
+    use_color_correction_metric: bool = False
 
     # Enable depth loss. (experimental)
     depth_loss: bool = False
@@ -174,9 +195,14 @@ class Config:
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
+    # 3DGUT (uncented transform + eval 3D)
+    with_ut: bool = False
+    with_eval3d: bool = False
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
+        self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
@@ -190,6 +216,10 @@ class Config:
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
+            if strategy.noise_injection_stop_iter >= 0:
+                strategy.noise_injection_stop_iter = int(
+                    strategy.noise_injection_stop_iter * factor
+                )
         else:
             assert_never(strategy)
 
@@ -201,6 +231,12 @@ def create_splats_with_optimizers(
     init_extent: float = 3.0,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
+    means_lr: float = 1.6e-4,
+    scales_lr: float = 5e-3,
+    opacities_lr: float = 5e-2,
+    quats_lr: float = 1e-3,
+    sh0_lr: float = 2.5e-3,
+    shN_lr: float = 2.5e-3 / 20,
     scene_scale: float = 1.0,
     sh_degree: int = 3,
     sparse_grad: bool = False,
@@ -236,24 +272,24 @@ def create_splats_with_optimizers(
 
     params = [
         # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-4 / 10 * scene_scale),
-        ("scales", torch.nn.Parameter(scales), 5e-3 / 5),
-        ("quats", torch.nn.Parameter(quats), 1e-3 / 5),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2 / 5),
+        ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+        ("scales", torch.nn.Parameter(scales), scales_lr),
+        ("quats", torch.nn.Parameter(quats), quats_lr),
+        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
 
     if feature_dim is None:
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
         colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3 / 50))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20 / 50))
+        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), 2.5e-3))
+        params.append(("features", torch.nn.Parameter(features), sh0_lr))
         colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
+        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -274,6 +310,7 @@ def create_splats_with_optimizers(
             eps=1e-15 / math.sqrt(BS),
             # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            fused=True,
         )
         for name, _, lr in params
     }
@@ -304,6 +341,8 @@ class Runner:
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
+        self.ply_dir = f"{cfg.result_dir}/ply"
+        os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -314,6 +353,7 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            load_exposure=cfg.load_exposure,
         )
         self.trainset = Dataset(
             self.parser,
@@ -325,6 +365,25 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
+        if self.parser.num_cameras > 1 and cfg.batch_size != 1:
+            raise ValueError(
+                f"When using multiple cameras ({self.parser.num_cameras} found), batch_size must be 1, "
+                f"but got batch_size={cfg.batch_size}."
+            )
+        if cfg.post_processing == "ppisp" and cfg.batch_size != 1:
+            raise ValueError(
+                f"PPISP post-processing requires batch_size=1, got batch_size={cfg.batch_size}"
+            )
+        if cfg.post_processing is not None and world_size > 1:
+            raise ValueError(
+                f"Post-processing ({cfg.post_processing}) requires single-GPU training, "
+                f"but world_size={world_size}."
+            )
+        if cfg.post_processing == "ppisp" and isinstance(cfg.strategy, DefaultStrategy):
+            raise ValueError(
+                f"PPISP post-processing requires MCMCStrategy at the moment."
+            )
+
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
@@ -334,6 +393,12 @@ class Runner:
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
+            means_lr=cfg.means_lr,
+            scales_lr=cfg.scales_lr,
+            opacities_lr=cfg.opacities_lr,
+            quats_lr=cfg.quats_lr,
+            sh0_lr=cfg.sh0_lr,
+            shN_lr=cfg.shN_lr,
             scene_scale=self.scene_scale,
             sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
@@ -409,21 +474,40 @@ class Runner:
             if world_size > 1:
                 self.app_module = DDP(self.app_module)
 
-        self.bil_grid_optimizers = []
-        if cfg.use_bilateral_grid:
-            self.bil_grids = BilateralGrid(
+        self.post_processing_module = None
+        if cfg.post_processing == "bilateral_grid":
+            self.post_processing_module = BilateralGrid(
                 len(self.trainset),
                 grid_X=cfg.bilateral_grid_shape[0],
                 grid_Y=cfg.bilateral_grid_shape[1],
                 grid_W=cfg.bilateral_grid_shape[2],
             ).to(self.device)
-            self.bil_grid_optimizers = [
+        elif cfg.post_processing == "ppisp":
+            ppisp_config = PPISPConfig(
+                use_controller=cfg.ppisp_use_controller,
+                controller_distillation=cfg.ppisp_controller_distillation,
+                controller_activation_ratio=cfg.ppisp_controller_activation_num_steps
+                / cfg.max_steps,
+            )
+            self.post_processing_module = PPISP(
+                num_cameras=self.parser.num_cameras,
+                num_frames=len(self.trainset),
+                config=ppisp_config,
+            ).to(self.device)
+
+        self.post_processing_optimizers = []
+        if cfg.post_processing == "bilateral_grid":
+            self.post_processing_optimizers = [
                 torch.optim.Adam(
-                    self.bil_grids.parameters(),
+                    self.post_processing_module.parameters(),
                     lr=2e-3 * math.sqrt(cfg.batch_size),
                     eps=1e-15,
                 ),
             ]
+        elif cfg.post_processing == "ppisp":
+            self.post_processing_optimizers = (
+                self.post_processing_module.create_optimizers()
+            )
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -444,26 +528,30 @@ class Runner:
         # Viewer
         if not self.cfg.disable_viewer:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
-            self.viewer = nerfview.Viewer(
+            self.viewer = GsplatViewer(
                 server=self.server,
                 render_fn=self._viewer_render_fn,
+                output_dir=Path(cfg.result_dir),
                 mode="training",
             )
-            
-        # Fixer trajectory 
-        self.interpolator = CameraPoseInterpolator(rotation_weight=1.0, translation_weight=1.0)
 
-        self.current_novel_poses = self.parser.camtoworlds[self.trainset.indices]
-        self.current_parser = self.parser
+        # Track if Gaussians are frozen (for controller distillation)
+        self._gaussians_frozen = False
 
-        self.novelloaders = []
-        self.novelloaders_iter = []
-        
-        # Diffusion fixer
-        self.difix = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
-        self.difix.set_progress_bar_config(disable=True)
-        # self.difix.to("cuda")
-        self.difix.enable_model_cpu_offload() # <--- Thêm dòng này
+    def freeze_gaussians(self):
+        """Freeze all Gaussian parameters for controller distillation.
+
+        This prevents Gaussians from being updated by any loss (including regularization)
+        while the controller learns to predict per-frame corrections.
+        """
+        if self._gaussians_frozen:
+            return
+
+        for name, param in self.splats.items():
+            param.requires_grad = False
+
+        self._gaussians_frozen = True
+        print("[Distillation] Gaussian parameters frozen")
 
     def rasterize_splats(
         self,
@@ -472,9 +560,16 @@ class Runner:
         width: int,
         height: int,
         masks: Optional[Tensor] = None,
+        rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
+        camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
+        frame_idcs: Optional[Tensor] = None,
+        camera_idcs: Optional[Tensor] = None,
+        exposure: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
+        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
+        # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
@@ -492,7 +587,10 @@ class Runner:
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
-        rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
+        if rasterize_mode is None:
+            rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
+        if camera_model is None:
+            camera_model = self.cfg.camera_model
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -513,13 +611,56 @@ class Runner:
             rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
             camera_model=self.cfg.camera_model,
+            with_ut=self.cfg.with_ut,
+            with_eval3d=self.cfg.with_eval3d,
             **kwargs,
         )
         if masks is not None:
             render_colors[~masks] = 0
+
+        if self.cfg.post_processing is not None:
+            # Create pixel coordinates [H, W, 2] with +0.5 center offset
+            pixel_y, pixel_x = torch.meshgrid(
+                torch.arange(height, device=self.device) + 0.5,
+                torch.arange(width, device=self.device) + 0.5,
+                indexing="ij",
+            )
+            pixel_coords = torch.stack([pixel_x, pixel_y], dim=-1)  # [H, W, 2]
+
+            # Split RGB from extra channels (e.g. depth) for post-processing
+            rgb = render_colors[..., :3]
+            extra = render_colors[..., 3:] if render_colors.shape[-1] > 3 else None
+
+            if self.cfg.post_processing == "bilateral_grid":
+                if frame_idcs is not None:
+                    grid_xy = (
+                        pixel_coords / torch.tensor([width, height], device=self.device)
+                    ).unsqueeze(0)
+                    rgb = slice(
+                        self.post_processing_module,
+                        grid_xy.expand(rgb.shape[0], -1, -1, -1),
+                        rgb,
+                        frame_idcs.unsqueeze(-1),
+                    )["rgb"]
+            elif self.cfg.post_processing == "ppisp":
+                camera_idx = camera_idcs.item() if camera_idcs is not None else None
+                frame_idx = frame_idcs.item() if frame_idcs is not None else None
+                rgb = self.post_processing_module(
+                    rgb=rgb,
+                    pixel_coords=pixel_coords,
+                    resolution=(width, height),
+                    camera_idx=camera_idx,
+                    frame_idx=frame_idx,
+                    exposure_prior=exposure,
+                )
+
+            render_colors = (
+                torch.cat([rgb, extra], dim=-1) if extra is not None else rgb
+            )
+
         return render_colors, render_alphas, info
 
-    def train(self, step=0):
+    def train(self):
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
@@ -531,7 +672,7 @@ class Runner:
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
-        init_step = step
+        init_step = 0
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
@@ -546,22 +687,30 @@ class Runner:
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
-        if cfg.use_bilateral_grid:
-            # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
+        # Post-processing module has a learning rate schedule
+        if cfg.post_processing == "bilateral_grid":
+            # Linear warmup + exponential decay
             schedulers.append(
                 torch.optim.lr_scheduler.ChainedScheduler(
                     [
                         torch.optim.lr_scheduler.LinearLR(
-                            self.bil_grid_optimizers[0],
+                            self.post_processing_optimizers[0],
                             start_factor=0.01,
                             total_iters=1000,
                         ),
                         torch.optim.lr_scheduler.ExponentialLR(
-                            self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                            self.post_processing_optimizers[0],
+                            gamma=0.01 ** (1.0 / max_steps),
                         ),
                     ]
                 )
             )
+        elif cfg.post_processing == "ppisp":
+            ppisp_schedulers = self.post_processing_module.create_schedulers(
+                self.post_processing_optimizers,
+                max_optimization_iters=max_steps,
+            )
+            schedulers.extend(ppisp_schedulers)
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
@@ -578,25 +727,25 @@ class Runner:
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             if not cfg.disable_viewer:
-                while self.viewer.state.status == "paused":
+                while self.viewer.state == "paused":
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
 
-            if len(self.novelloaders) == 0 or random.random() < 0.7:
-                try:
-                    data = next(trainloader_iter)
-                except StopIteration:
-                    trainloader_iter = iter(trainloader)
-                    data = next(trainloader_iter)
-                is_novel_data = False
-            else:
-                try:
-                    data = next(self.novelloaders_iter[-1])
-                except StopIteration:
-                    self.novelloaders_iter[-1] = iter(self.novelloaders[-1])
-                    data = next(self.novelloaders_iter[-1])        
-                is_novel_data = True
+            # Freeze Gaussians when PPISP controller distillation starts
+            if (
+                cfg.post_processing == "ppisp"
+                and cfg.ppisp_use_controller
+                and cfg.ppisp_controller_distillation
+                and step >= cfg.ppisp_controller_activation_num_steps
+            ):
+                self.freeze_gaussians()
+
+            try:
+                data = next(trainloader_iter)
+            except StopIteration:
+                trainloader_iter = iter(trainloader)
+                data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
@@ -606,7 +755,9 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
-            alpha_masks = data["alpha_mask"].to(device) if "alpha_mask" in data else None  # [1, H, W, 1]
+            exposure = (
+                data["exposure"].to(device) if "exposure" in data else None
+            )  # [B,]
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -634,28 +785,18 @@ class Runner:
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
+                frame_idcs=image_ids,
+                camera_idcs=data["camera_idx"].to(device),
+                exposure=exposure,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
 
-            if cfg.use_bilateral_grid:
-                grid_y, grid_x = torch.meshgrid(
-                    (torch.arange(height, device=self.device) + 0.5) / height,
-                    (torch.arange(width, device=self.device) + 0.5) / width,
-                    indexing="ij",
-                )
-                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-                colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
-
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
-
-            if is_novel_data and alpha_masks is not None:
-                colors = colors * (alpha_masks > 0.5).float()
-                pixels = pixels * (alpha_masks > 0.5).float()
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -690,27 +831,23 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
-            if cfg.use_bilateral_grid:
-                tvloss = 10 * total_variation_loss(self.bil_grids.grids)
-                loss += tvloss
+            if cfg.post_processing == "bilateral_grid":
+                post_processing_reg_loss = 10 * total_variation_loss(
+                    self.post_processing_module.grids
+                )
+                loss += post_processing_reg_loss
+            elif cfg.post_processing == "ppisp":
+                post_processing_reg_loss = (
+                    self.post_processing_module.get_regularization_loss()
+                )
+                loss += post_processing_reg_loss
 
             # regularizations
             if cfg.opacity_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.opacity_reg
-                    * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
-                )
+                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
-                )
+                loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
-            if is_novel_data:
-                loss = loss * cfg.novel_data_lambda
-            else:
-                loss = loss * 1.5
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -722,6 +859,15 @@ class Runner:
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
 
+            # write images (gt and render)
+            # if world_rank == 0 and step % 800 == 0:
+            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
+            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
+            #     imageio.imwrite(
+            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
+            #         (canvas * 255).astype(np.uint8),
+            #     )
+
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
@@ -731,8 +877,12 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
-                if cfg.use_bilateral_grid:
-                    self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                if cfg.post_processing is not None:
+                    self.writer.add_scalar(
+                        "train/post_processing_reg_loss",
+                        post_processing_reg_loss.item(),
+                        step,
+                    )
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -764,8 +914,44 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                if self.post_processing_module is not None:
+                    data["post_processing"] = self.post_processing_module.state_dict()
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                )
+            if (
+                step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
+            ) and cfg.save_ply:
+
+                if self.cfg.app_opt:
+                    # eval at origin to bake the appeareance into the colors
+                    rgb = self.app_module(
+                        features=self.splats["features"],
+                        embed_ids=None,
+                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                        sh_degree=sh_degree_to_use,
+                    )
+                    rgb = rgb + self.splats["colors"]
+                    rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+                    sh0 = rgb_to_sh(rgb)
+                    shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+                else:
+                    sh0 = self.splats["sh0"]
+                    shN = self.splats["shN"]
+
+                means = self.splats["means"]
+                scales = self.splats["scales"]
+                quats = self.splats["quats"]
+                opacities = self.splats["opacities"]
+                export_splats(
+                    means=means,
+                    scales=scales,
+                    quats=quats,
+                    opacities=opacities,
+                    sh0=sh0,
+                    shN=shN,
+                    format="ply",
+                    save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
                 )
 
             # Turn Gradients into Sparse Tensor before running optimizer
@@ -791,7 +977,7 @@ class Runner:
                     )
                     visibility_mask.scatter_(0, info["gaussian_ids"], 1)
                 else:
-                    visibility_mask = (info["radii"] > 0).any(0)
+                    visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # optimize
             for optimizer in self.optimizers.values():
@@ -806,7 +992,7 @@ class Runner:
             for optimizer in self.app_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.bil_grid_optimizers:
+            for optimizer in self.post_processing_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
@@ -837,79 +1023,25 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
+                self.render_traj(step)
 
-            # run fixer
-            if step in [i - 1 for i in cfg.fix_steps]:
-                self.fix(step)
-            
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
                 self.run_compression(step=step)
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
-                num_train_steps_per_sec = 1.0 / (time.time() - tic)
+                num_train_steps_per_sec = 1.0 / (max(time.time() - tic, 1e-10))
                 num_train_rays_per_sec = (
                     num_train_rays_per_step * num_train_steps_per_sec
                 )
                 # Update the viewer state.
-                self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
+                self.viewer.render_tab_state.num_train_rays_per_sec = (
+                    num_train_rays_per_sec
+                )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
-    
-    @torch.no_grad()
-    def fix(self, step: int):
-        print("Running fixer...")
-        if len(self.cfg.fix_steps) == 1:
-            novel_poses = self.parser.camtoworlds[self.valset.indices]
-        else:
-            novel_poses = self.interpolator.shift_poses(self.current_novel_poses, self.parser.camtoworlds[self.valset.indices], distance=0.5)
-        
-        self.render_traj(step, novel_poses)
-        image_paths = [f"{self.render_dir}/novel/{step}/Pred/{i:04d}.png" for i in range(len(novel_poses))]
 
-        if len(self.novelloaders) == 0:
-            ref_image_indices = self.interpolator.find_nearest_assignments(self.parser.camtoworlds[self.trainset.indices], novel_poses)
-            ref_image_paths = [self.parser.image_paths[i] for i in np.array(self.trainset.indices)[ref_image_indices]]
-        else:
-            ref_image_indices = self.interpolator.find_nearest_assignments(self.parser.camtoworlds[self.trainset.indices], novel_poses)
-            ref_image_paths = [self.parser.image_paths[i] for i in np.array(self.trainset.indices)[ref_image_indices]]
-        assert len(image_paths) == len(ref_image_paths) == len(novel_poses)
-
-        for i in tqdm.trange(0, len(novel_poses), desc="Fixing artifacts..."):
-            image = Image.open(image_paths[i]).convert("RGB")
-            ref_image = Image.open(ref_image_paths[i]).convert("RGB")
-            output_image = self.difix(prompt="remove degradation", image=image, ref_image=ref_image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-            output_image = output_image.resize(image.size, Image.LANCZOS)
-            os.makedirs(f"{self.render_dir}/novel/{step}/Fixed", exist_ok=True)
-            output_image.save(f"{self.render_dir}/novel/{step}/Fixed/{i:04d}.png")
-            if ref_image is not None:
-                os.makedirs(f"{self.render_dir}/novel/{step}/Ref", exist_ok=True)
-                ref_image.save(f"{self.render_dir}/novel/{step}/Ref/{i:04d}.png")
-    
-        parser = deepcopy(self.parser)
-        parser.test_every = 0
-        parser.image_paths = [f"{self.render_dir}/novel/{step}/Fixed/{i:04d}.png" for i in range(len(novel_poses))]
-        parser.image_names = [os.path.basename(p) for p in parser.image_paths]
-        parser.alpha_mask_paths = [f"{self.render_dir}/novel/{step}/Alpha/{i:04d}.png" for i in range(len(novel_poses))]
-        parser.camtoworlds = novel_poses
-        parser.camera_ids = [parser.camera_ids[0]] * len(novel_poses)
-        
-        print(f"Adding {len(parser.image_paths)} fixed images to novel dataset...")
-        dataset = Dataset(parser, split="train")
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
-        )
-        self.novelloaders.append(dataloader)
-        self.novelloaders_iter.append(iter(dataloader))
-
-        self.current_novel_poses = novel_poses
-            
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
@@ -924,16 +1056,19 @@ class Runner:
         )
         ellipse_time = 0
         metrics = defaultdict(list)
-        for i, data in enumerate(tqdm.tqdm(valloader)):
+        for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
+            # Exposure metadata is available for any image with EXIF data (train or val)
+            exposure = data["exposure"].to(device) if "exposure" in data else None
+
             torch.cuda.synchronize()
             tic = time.time()
-            colors, alphas, _ = self.rasterize_splats(
+            colors, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -942,42 +1077,40 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 masks=masks,
+                frame_idcs=None,  # For novel views, pass None (no per-frame parameters available)
+                camera_idcs=data["camera_idx"].to(device),
+                exposure=exposure,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
-            ellipse_time += time.time() - tic
+            ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
                 # write images
-                pixels_path = f"{self.render_dir}/val/{step}/GT/{i:04d}.png"
-                os.makedirs(os.path.dirname(pixels_path), exist_ok=True)
-                pixels_canvas = pixels.squeeze(0).cpu().numpy()
-                pixels_canvas = (pixels_canvas * 255).astype(np.uint8)
-                imageio.imwrite(pixels_path, pixels_canvas)
-
-                colors_path = f"{self.render_dir}/val/{step}/Pred/{i:04d}.png"
-                os.makedirs(os.path.dirname(colors_path), exist_ok=True)
-                colors_canvas = colors.squeeze(0).cpu().numpy()
-                colors_canvas = (colors_canvas * 255).astype(np.uint8)
-                imageio.imwrite(colors_path, colors_canvas)
-                
-                alphas_path = f"{self.render_dir}/val/{step}/Alpha/{i:04d}.png"
-                os.makedirs(os.path.dirname(alphas_path), exist_ok=True)
-                alphas_canvas = (alphas < 0.5).squeeze(0).cpu().numpy()
-                alphas_canvas = (alphas_canvas * 255).astype(np.uint8)
-                Image.fromarray(alphas_canvas.squeeze(), mode='L').save(alphas_path)
+                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                canvas = (canvas * 255).astype(np.uint8)
+                imageio.imwrite(
+                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
+                    canvas,
+                )
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))
                 metrics["ssim"].append(self.ssim(colors_p, pixels_p))
                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
-                if cfg.use_bilateral_grid:
-                    cc_colors = color_correct(colors, pixels)
+                # Compute color-corrected metrics for fair comparison across methods
+                if cfg.use_color_correction_metric:
+                    if cfg.color_correct_method == "affine":
+                        cc_colors = color_correct_affine(colors, pixels)
+                    else:
+                        cc_colors = color_correct_quadratic(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                     metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
+                    metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
+                    metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
 
         if world_rank == 0:
             ellipse_time /= len(valloader)
@@ -989,11 +1122,19 @@ class Runner:
                     "num_GS": len(self.splats["means"]),
                 }
             )
-            print(
-                f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                f"Time: {stats['ellipse_time']:.3f}s/image "
-                f"Number of GS: {stats['num_GS']}"
-            )
+            if cfg.use_color_correction_metric:
+                print(
+                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
+                    f"Time: {stats['ellipse_time']:.3f}s/image "
+                    f"Number of GS: {stats['num_GS']}"
+                )
+            else:
+                print(
+                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+                    f"Time: {stats['ellipse_time']:.3f}s/image "
+                    f"Number of GS: {stats['num_GS']}"
+                )
             # save stats as json
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
                 json.dump(stats, f)
@@ -1003,53 +1144,58 @@ class Runner:
             self.writer.flush()
 
     @torch.no_grad()
-    def render_traj(self, step: int, camtoworlds_all=None, batch_size=8, tag="novel"):
+    def render_traj(self, step: int):
         """Entry for trajectory rendering."""
+        if self.cfg.disable_video:
+            return
         print("Running trajectory rendering...")
         cfg = self.cfg
         device = self.device
 
-        if camtoworlds_all is None:
-            camtoworlds_all = self.parser.camtoworlds[5:-5]
-            if cfg.render_traj_path == "interp":
-                camtoworlds_all = generate_interpolated_path(
-                    camtoworlds_all, 1
-                )  # [N, 3, 4]
-            elif cfg.render_traj_path == "ellipse":
-                height = camtoworlds_all[:, 2, 3].mean()
-                camtoworlds_all = generate_ellipse_path_z(
-                    camtoworlds_all, height=height
-                )  # [N, 3, 4]
-            elif cfg.render_traj_path == "spiral":
-                camtoworlds_all = generate_spiral_path(
-                    camtoworlds_all,
-                    bounds=self.parser.bounds * self.scene_scale,
-                    spiral_scale_r=self.parser.extconf["spiral_radius_scale"],
-                )
-            else:
-                raise ValueError(
-                    f"Render trajectory type not supported: {cfg.render_traj_path}"
-                )
+        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        if cfg.render_traj_path == "interp":
+            camtoworlds_all = generate_interpolated_path(
+                camtoworlds_all, 1
+            )  # [N, 3, 4]
+        elif cfg.render_traj_path == "ellipse":
+            height = camtoworlds_all[:, 2, 3].mean()
+            camtoworlds_all = generate_ellipse_path_z(
+                camtoworlds_all, height=height
+            )  # [N, 3, 4]
+        elif cfg.render_traj_path == "spiral":
+            camtoworlds_all = generate_spiral_path(
+                camtoworlds_all,
+                bounds=self.parser.bounds * self.scene_scale,
+                spiral_scale_r=self.parser.extconf["spiral_radius_scale"],
+            )
+        else:
+            raise ValueError(
+                f"Render trajectory type not supported: {cfg.render_traj_path}"
+            )
 
-            camtoworlds_all = np.concatenate(
-                [
-                    camtoworlds_all,
-                    np.repeat(
-                        np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds_all), axis=0
-                    ),
-                ],
-                axis=1,
-            )  # [N, 4, 4]
+        camtoworlds_all = np.concatenate(
+            [
+                camtoworlds_all,
+                np.repeat(
+                    np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds_all), axis=0
+                ),
+            ],
+            axis=1,
+        )  # [N, 4, 4]
 
         camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
-        for i in tqdm.trange(0, len(camtoworlds_all), batch_size, desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + batch_size]
-            Ks = K[None].repeat(camtoworlds.shape[0], 1, 1)
+        # save to video
+        video_dir = f"{cfg.result_dir}/videos"
+        os.makedirs(video_dir, exist_ok=True)
+        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
+        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
+            camtoworlds = camtoworlds_all[i : i + 1]
+            Ks = K[None]
 
-            renders, alphas, _ = self.rasterize_splats(
+            renders, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1058,25 +1204,49 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
-            )  # [B, H, W, 4]
+            )  # [1, H, W, 4]
+            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
+            depths = renders[..., 3:4]  # [1, H, W, 1]
+            depths = (depths - depths.min()) / (depths.max() - depths.min())
+            canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
 
-            for j in range(renders.shape[0]):
-                colors = torch.clamp(renders[j, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
-                depths = renders[j, ..., 3:4]  # [H, W, 1]
-                depths = (depths - depths.min()) / (depths.max() - depths.min())
-                
-                idx = i + j
-                colors_path = f"{self.render_dir}/{tag}/{step}/Pred/{idx:04d}.png"
-                os.makedirs(os.path.dirname(colors_path), exist_ok=True)
-                colors_canvas = colors.cpu().numpy()
-                colors_canvas = (colors_canvas * 255).astype(np.uint8)
-                imageio.imwrite(colors_path, colors_canvas)
-                
-                alphas_path = f"{self.render_dir}/{tag}/{step}/Alpha/{idx:04d}.png"
-                os.makedirs(os.path.dirname(alphas_path), exist_ok=True)
-                alphas_canvas = alphas[j].float().cpu().numpy()
-                alphas_canvas = (alphas_canvas * 255).astype(np.uint8)
-                Image.fromarray(alphas_canvas.squeeze(), mode='L').save(alphas_path)
+            # write images
+            canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+            canvas = (canvas * 255).astype(np.uint8)
+            writer.append_data(canvas)
+        writer.close()
+        print(f"Video saved to {video_dir}/traj_{step}.mp4")
+
+    @torch.no_grad()
+    def export_ppisp_reports(self) -> None:
+        """Export PPISP visualization reports (PDF) and parameter JSON."""
+        if self.cfg.post_processing != "ppisp":
+            return
+        print("Exporting PPISP reports...")
+
+        # Compute frames per camera from training dataset
+        num_cameras = self.parser.num_cameras
+        frames_per_camera = [0] * num_cameras
+        for idx in self.trainset.indices:
+            cam_idx = self.parser.camera_indices[idx]
+            frames_per_camera[cam_idx] += 1
+
+        # Generate camera names from COLMAP camera IDs
+        # camera_id_to_idx maps COLMAP ID -> 0-based index
+        idx_to_camera_id = {v: k for k, v in self.parser.camera_id_to_idx.items()}
+        camera_names = [f"camera_{idx_to_camera_id[i]}" for i in range(num_cameras)]
+
+        # Export reports
+        output_dir = Path(self.cfg.result_dir) / "ppisp_reports"
+        pdf_paths = export_ppisp_report(
+            self.post_processing_module,
+            frames_per_camera,
+            output_dir,
+            camera_names=camera_names,
+        )
+        print(f"PPISP reports saved to {output_dir}")
+        for path in pdf_paths:
+            print(f"  - {path.name}")
 
     @torch.no_grad()
     def run_compression(self, step: int):
@@ -1097,27 +1267,100 @@ class Runner:
 
     @torch.no_grad()
     def _viewer_render_fn(
-        self, camera_state: nerfview.CameraState, img_wh: Tuple[int, int]
+        self, camera_state: CameraState, render_tab_state: RenderTabState
     ):
-        """Callable function for the viewer."""
-        W, H = img_wh
+        assert isinstance(render_tab_state, GsplatRenderTabState)
+        if render_tab_state.preview_render:
+            width = render_tab_state.render_width
+            height = render_tab_state.render_height
+        else:
+            width = render_tab_state.viewer_width
+            height = render_tab_state.viewer_height
         c2w = camera_state.c2w
-        K = camera_state.get_K(img_wh)
+        K = camera_state.get_K((width, height))
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
-        render_colors, _, _ = self.rasterize_splats(
+        RENDER_MODE_MAP = {
+            "rgb": "RGB",
+            "depth(accumulated)": "D",
+            "depth(expected)": "ED",
+            "alpha": "RGB",
+        }
+
+        render_colors, render_alphas, info = self.rasterize_splats(
             camtoworlds=c2w[None],
             Ks=K[None],
-            width=W,
-            height=H,
-            sh_degree=self.cfg.sh_degree,  # active all SH degrees
-            radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
+            width=width,
+            height=height,
+            sh_degree=min(render_tab_state.max_sh_degree, self.cfg.sh_degree),
+            near_plane=render_tab_state.near_plane,
+            far_plane=render_tab_state.far_plane,
+            radius_clip=render_tab_state.radius_clip,
+            eps2d=render_tab_state.eps2d,
+            backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
+            / 255.0,
+            render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
+            rasterize_mode=render_tab_state.rasterize_mode,
+            camera_model=render_tab_state.camera_model,
         )  # [1, H, W, 3]
-        return render_colors[0].cpu().numpy()
+        render_tab_state.total_gs_count = len(self.splats["means"])
+        render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
+
+        if render_tab_state.render_mode == "rgb":
+            # colors represented with sh are not guranteed to be in [0, 1]
+            render_colors = render_colors[0, ..., 0:3].clamp(0, 1)
+            renders = render_colors.cpu().numpy()
+        elif render_tab_state.render_mode in ["depth(accumulated)", "depth(expected)"]:
+            # normalize depth to [0, 1]
+            depth = render_colors[0, ..., 0:1]
+            if render_tab_state.normalize_nearfar:
+                near_plane = render_tab_state.near_plane
+                far_plane = render_tab_state.far_plane
+            else:
+                near_plane = depth.min()
+                far_plane = depth.max()
+            depth_norm = (depth - near_plane) / (far_plane - near_plane + 1e-10)
+            depth_norm = torch.clip(depth_norm, 0, 1)
+            if render_tab_state.inverse:
+                depth_norm = 1 - depth_norm
+            renders = (
+                apply_float_colormap(depth_norm, render_tab_state.colormap)
+                .cpu()
+                .numpy()
+            )
+        elif render_tab_state.render_mode == "alpha":
+            alpha = render_alphas[0, ..., 0:1]
+            if render_tab_state.inverse:
+                alpha = 1 - alpha
+            renders = (
+                apply_float_colormap(alpha, render_tab_state.colormap).cpu().numpy()
+            )
+        return renders
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+    # Import post-processing modules based on configuration
+    # These imports must be here (not in __main__) for distributed workers
+    if cfg.post_processing == "bilateral_grid":
+        global BilateralGrid, slice, total_variation_loss
+        if cfg.bilateral_grid_fused:
+            from fused_bilagrid import (
+                BilateralGrid,
+                slice,
+                total_variation_loss,
+            )
+        else:
+            from lib_bilagrid import (
+                BilateralGrid,
+                slice,
+                total_variation_loss,
+            )
+    elif cfg.post_processing == "ppisp":
+        global PPISP, PPISPConfig, export_ppisp_report
+        from ppisp import PPISP, PPISPConfig
+        from ppisp.report import export_ppisp_report
+
     if world_size > 1 and not cfg.disable_viewer:
         cfg.disable_viewer = True
         if world_rank == 0:
@@ -1133,12 +1376,21 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        if runner.post_processing_module is not None:
+            pp_state = ckpts[0].get("post_processing")
+            if pp_state is not None:
+                runner.post_processing_module.load_state_dict(pp_state)
         step = ckpts[0]["step"]
-        runner.train(step=step)
+        runner.eval(step=step)
+        runner.render_traj(step=step)
+        if cfg.compression is not None:
+            runner.run_compression(step=step)
     else:
         runner.train()
+        runner.export_ppisp_reports()
 
     if not cfg.disable_viewer:
+        runner.viewer.complete()
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
 
@@ -1149,7 +1401,7 @@ if __name__ == "__main__":
 
     ```bash
     # Single GPU training
-    CUDA_VISIBLE_DEVICES=0 python simple_trainer.py default
+    CUDA_VISIBLE_DEVICES=9 python -m examples.simple_trainer default
 
     # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
     CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
@@ -1190,5 +1442,8 @@ if __name__ == "__main__":
                 "torchpq (instruction at https://github.com/DeMoriarty/TorchPQ?tab=readme-ov-file#install) "
                 "and plas (via 'pip install git+https://github.com/fraunhoferhhi/PLAS.git') "
             )
+
+    if cfg.with_ut:
+        assert cfg.with_eval3d, "Training with UT requires setting `with_eval3d` flag."
 
     cli(main, cfg, verbose=True)

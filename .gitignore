@@ -1,0 +1,40 @@
+# --- Python & System Junk ---
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+Thumbs.db
+
+# --- Environments (Môi trường ảo) ---
+.env
+.venv
+env/
+venv/
+# Nếu bạn để env conda ngay trong project
+difix3d_env/
+
+# --- IDE Settings (Cấu hình Editor) ---
+.vscode/
+.idea/
+
+# --- Project Data & Outputs (Quan trọng: Không commit file nặng) ---
+# Dữ liệu đầu vào (Dataset 360, colmap...)
+data/
+
+# Kết quả train, checkpoints, ảnh render
+outputs/
+results/
+
+# --- Temporary & Log Files (File tạm bạn vừa tạo) ---
+# Các file log terminal
+*.log
+terminal_log_*.txt
+
+# File test setup tạm thời
+test_setup.py
+
+# Ảnh test output lẻ tẻ
+example_output.png
+
+# --- Optional: Giữ lại requirements ---
+# (Không ignore requirements_gsplat.txt vì file này quan trọng để người khác cài env giống bạn)
